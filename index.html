@@ -98,7 +98,7 @@ button:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
 @keyframes pop{from{transform:scale(.6);opacity:0}}
 
 /* الميدان: the box cards are thrown into */
-.pit{position:absolute;left:50%;top:47%;transform:translate(-50%,-50%);width:calc(var(--cw)*3.5);height:calc(var(--ch)*2.4);
+.pit{position:absolute;z-index:4;left:50%;top:47%;transform:translate(-50%,-50%);width:calc(var(--cw)*3.5);height:calc(var(--ch)*2.4);
   border-radius:18px;border:2px dashed rgba(244,236,218,.22);background:rgba(0,0,0,.16);box-shadow:inset 0 0 30px rgba(0,0,0,.25)}
 .pit .mark{position:absolute;inset:0;display:grid;place-items:center;font-family:var(--f-display);font-size:calc(var(--cw)*.42);color:rgba(244,236,218,.12);letter-spacing:1px;pointer-events:none}
 .slot{position:absolute}
@@ -118,6 +118,7 @@ button:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
 
 /* trick piles in front of a teammate */
 .pile{position:absolute;z-index:2;display:flex;flex-direction:column;align-items:center;gap:4px}
+.s0row{display:flex;align-items:center;gap:8px}
 .pile.at0{bottom:12px;left:calc(50% + 66px)}
 .pile.at2{top:12px;left:calc(50% + 66px)}
 .pile.at1{right:12px;top:calc(43% + 96px)}
@@ -205,6 +206,7 @@ table.res tr.total td{color:var(--gold);font-weight:700;border-bottom:none}
 .seatrow .occ.empty{color:var(--muted)}
 .seatrow .bid{padding:6px 10px;font-size:13px;min-width:0}
 .tag.ai{background:rgba(244,236,218,.18);color:var(--ink)}
+.bid.kick{background:var(--them);color:#1b1206;padding:6px 10px;font-size:13px;min-width:0}
 .kashf{border:1.5px solid var(--them);color:var(--them);background:transparent;border-radius:10px;padding:8px 14px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit}
 .kashf.arm{background:var(--them);color:#1b1206}
 .kashf.used{border-style:dashed;opacity:.6;cursor:default;font-weight:500;font-size:12px;padding:6px 10px}
@@ -291,6 +293,7 @@ table.res tr.total td{color:var(--gold);font-weight:700;border-bottom:none}
       <div class="team them"><span class="tn">لهم<small id="nThem">الخصم</small></span><b id="scThem">0</b><span class="meter"><i id="mThem"></i></span></div>
     </div>
     <div class="tools">
+      <button class="ghost" id="btnPlayers" type="button" hidden>اللاعبين</button>
       <button class="ghost exit" id="btnExit" type="button" hidden>خروج</button>
       <button class="ghost" id="btnHome" type="button">القائمة</button>
       <button class="ghost" id="btnLast" type="button">آخر أكلة</button>
@@ -321,7 +324,7 @@ const shareURL=()=>(NET.mode==='fb'?location.origin+location.pathname:ARTIFACT_U
 const CODE_CHARS='ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 
 let G=null, timer=null, justPlayed=null, showLast=false, showRules=false, showTables=false, localMsg='';
-let ui={screen:'home',joinErr:'',busy:false,copied:'',kashfArm:false,exitAsk:false};
+let ui={screen:'home',joinErr:'',busy:false,copied:'',kashfArm:false,exitAsk:false,showPlayers:false,kickArm:null};
 // shared-table state: the table document holds the whole game; the host's page runs computer seats and timings
 let NET={mode:null,fbErr:'',ready:false,db:null,user:null,uid:null,canWrite:null,on:false,code:null,ref:null,unsubT:null,unsubS:null,
   host:null,phase:null,rev:0,lastJson:'',updatedAt:0,n:4,seatDocs:[null,null,null,null,null,null],chain:Promise.resolve(),err:''};
@@ -829,6 +832,7 @@ async function joinTable(code){
   try{
     const s=await NET.db.doc('tables/'+code).get();
     if(!s.exists)ui.joinErr='ما لقيت طاولة بهالكود.';
+    else if((s.data().kicked||[]).includes(NET.uid))ui.joinErr='صاحب الطاولة طردك من هالطاولة.';
     else attach(code);
   }catch(e){ui.joinErr='ما قدرنا نوصل للطاولة. جرّب مرة ثانية.'}
   ui.busy=false;render();
@@ -863,7 +867,8 @@ function detach(){
 function onTable(snap){
   if(!snap.exists){NET.err='الطاولة انحذفت.';return render()}
   const d=snap.data();
-  NET.host=d.host;NET.phase=d.phase;NET.updatedAt=d.updatedAt||0;NET.n=d.n===6?6:4;
+  NET.host=d.host;NET.phase=d.phase;NET.updatedAt=d.updatedAt||0;NET.n=d.n===6?6:4;NET.kicked=d.kicked||[];
+  if(NET.kicked.includes(NET.uid)){kickedOut();return}
   if(d.phase==='game'&&d.stateJson&&(d.rev>NET.rev||(d.rev===NET.rev&&d.stateJson!==NET.lastJson))){
     const prevLen=G&&G.trick?G.trick.length:0;
     NET.rev=d.rev;NET.lastJson=d.stateJson;G=JSON.parse(d.stateJson);
@@ -880,6 +885,7 @@ async function claimSeat(i){
     if(!lease.acquired)return false;
     const s=await ref.get();
     if(s.exists&&s.data().uid&&s.data().uid!==NET.uid)return false;
+    if((NET.kicked||[]).includes(NET.uid))return false;
     const mine=NET.seatDocs.indexOf(NET.uid);
     if(mine>=0&&mine!==i)await NET.db.doc(`tables/${NET.code}/seats/s${mine}`).set({uid:null});
     await ref.set(NET.mode==='fb'?{uid:NET.uid,name:myName()}:{uid:NET.uid});
@@ -898,6 +904,35 @@ async function exitGame(){
     try{await NET.chain}catch(e){}
   }
   leaveTable();
+}
+/* ---------- the host runs the table: they can kick any player, whose chair goes to the computer ---------- */
+const isHost=()=>NET.on&&NET.host===NET.uid;
+async function kickPlayer(u){
+  ui.kickArm=null;
+  if(!isHost()||!u||u===NET.uid)return render();
+  try{await NET.ref.update({kicked:[...new Set([...(NET.kicked||[]),u])]})}catch(e){return netError(e)}
+  const i=NET.seatDocs.indexOf(u);
+  if(NET.phase==='lobby'&&i>=0){try{await NET.db.doc(`tables/${NET.code}/seats/s${i}`).set({uid:null})}catch(e){}}
+  if(G&&G.seats){const p=G.seats.indexOf(u);if(p>=0){G.seats[p]=null;return advance()}}
+  render();
+}
+function kickedOut(){
+  detach();clearTimeout(timer);G=null;store.set('tableCode',null);
+  Object.assign(ui,{screen:'home',joinErr:'صاحب الطاولة طردك من الطاولة.',showPlayers:false,exitAsk:false});
+  render();
+}
+function playersHTML(){
+  const rows=G.seats.map((u,p)=>{
+    if(!u)return `<div class="seatrow"><span class="sn">${esc(nameOf(p))}<small>فريق ${p%2?'ب':'أ'}</small></span><span class="occ empty">كمبيوتر</span></div>`;
+    const btn=u===NET.uid?'<span class="occ empty">المضيف</span>':ui.kickArm===u
+      ?`<button class="bid kick" type="button" data-kick="${esc(u)}">متأكد؟ اطرد</button>`
+      :`<button class="bid pass" type="button" data-kickarm="${esc(u)}">اطرد</button>`;
+    return `<div class="seatrow ${u===NET.uid?'mine':''}"><span class="sn">${esc(nameOf(p))}<small>فريق ${p%2?'ب':'أ'}</small></span><span class="occ">${u===NET.uid?'':'لاعب'}</span>${btn}</div>`;
+  }).join('');
+  return `<div class="modal" data-close="players"><div class="sheet"><h2>اللاعبين</h2>
+    <p>أنت المضيف. إذا طردت لاعب، الكمبيوتر يلعب مكانه، وما يقدر يرجع لهالطاولة.</p>
+    <div class="seats">${rows}</div>
+    <button class="primary" type="button" data-close="players">تمام</button></div></div>`;
 }
 async function leaveTable(){
   const mine=NET.seatDocs.indexOf(NET.uid);
@@ -1002,23 +1037,22 @@ function render(){
   // seats are drawn from the viewer's chair: you at the bottom, play running to your right
   const n=G.n,V=p=>(p-vs+n)%n,m=me();
   const active=actorSeat();
-  // with six, each team's pile sits inside its owner's seat so it never crowds a neighbour
+  // each team's pile sits inside its owner's seat, beside the name, so it never covers a played card
   const pileHTML=tm=>{const lab=tm===U?'لنا':'لهم';
-    return `<div class="pile ${n===6?'in':'at'+V(G.pileOwner[tm])} ${tm===U?'us':'them'}" aria-label="أكلات ${lab}"><div class="stack">${'<span></span>'.repeat(G.tricks[tm])}</div><b>${lab} ${G.tricks[tm]}</b></div>`};
+    return `<div class="pile in ${tm===U?'us':'them'}" aria-label="أكلات ${lab}"><div class="stack">${'<span></span>'.repeat(G.tricks[tm])}</div><b>${lab} ${G.tricks[tm]}</b></div>`};
   const hasPile=p=>G.pileOwner[team(p)]===p&&G.tricks[team(p)]>0;
   let t='';
   for(const p of seatsOf()){
     const v=V(p);
-    const tags=(p===G.buyer?'<span class="tag">مشتري</span>':'')+(p===G.dealer&&!G.trump?'<span class="tag">موزّع</span>':'')+(NET.on&&isAI(p)?'<span class="tag ai">كمبيوتر</span>':'');
+    const tags=(p===G.buyer?'<span class="tag">مشتري</span>':'')+(p===G.dealer&&!G.trump?'<span class="tag">موزّع</span>':'')+(NET.on&&isAI(p)?'<span class="tag ai">كمبيوتر</span>':'')+(NET.on&&G.seats[p]&&G.seats[p]===NET.host?'<span class="tag">المضيف</span>':'');
     const base=nameOf(p),label=p!==m&&m>=0&&team(p)===team(m)?base+' (ربيعك)':base;
     const backs=v===0&&m>=0?'':`<div class="backs">${G.hands[p].map(()=>'<div class="back"></div>').join('')}</div>`;
     const ph=phr[p]&&phr[p].until>Date.now()?PHRASES[phr[p].i]:'';
     const bub=ph?`<div class="bubble say">${esc(ph)}</div>`:G.say[p]?`<div class="bubble">${esc(G.say[p])}</div>`:'';
     const who=`<div class="who"><span class="avatar">${esc(base[0])}</span><span>${esc(label)}</span>${tags}${micHTML(p)}${v===0&&m>=0?'':`<span class="cnt">${G.hands[p].length}</span>`}</div>`;
-    const pile=n===6&&hasPile(p)?pileHTML(team(p)):'';
-    t+=`<div class="seat s${v} ${team(p)===U?'us':'them'} ${active===p?'turn':''}">${v===0?pile+bub+who+(m<0?backs:''):who+backs+bub+pile}</div>`;
+    const pile=hasPile(p)?pileHTML(team(p)):'';
+    t+=`<div class="seat s${v} ${team(p)===U?'us':'them'} ${active===p?'turn':''}">${v===0?bub+`<div class="s0row">${who}${pile}</div>`+(m<0?backs:''):v===n/2?`<div class="s0row">${who}${pile}</div>`+backs+bub:who+backs+bub+pile}</div>`;
   }
-  if(n===4)for(const tm of [0,1])if(G.pileOwner[tm]>=0&&G.tricks[tm])t+=pileHTML(tm);
   t+=`<div class="pit ${G.sweepTo>=0?'sweep at'+V(G.sweepTo):''}">${G.trick.length?'':'<span class="mark">الميدان</span>'}`;
   const wi=G.trick.length===n?winIdx(G.trick):-1;
   G.trick.forEach((e,i)=>{t+=`<div class="slot p${V(e.p)}">${cardHTML(e.c,(id(e.c)===justPlayed?'in ':'')+(i===wi?'win':''))}</div>`});
@@ -1080,7 +1114,8 @@ function lobbyHTML(){
   const host=NET.host===NET.uid,mine=NET.seatDocs.indexOf(NET.uid);
   const rows=[...Array(NET.n).keys()].map(i=>{
     const u=NET.seatDocs[i],who=u?(u===NET.uid?'أنت':(names[u]||'لاعب')):'فاضي — يلعبه الكمبيوتر';
-    return `<div class="seatrow ${u===NET.uid?'mine':''}"><span class="sn">الكرسي ${AR_NUM[i+1]}<small>فريق ${i%2?'ب':'أ'}</small></span><span class="occ ${u?'':'empty'}">${esc(who)}</span>${!u&&NET.canWrite!==false?`<button class="bid pass" type="button" data-seat="${i}">اجلس هنا</button>`:''}</div>`;
+    return `<div class="seatrow ${u===NET.uid?'mine':''}"><span class="sn">الكرسي ${AR_NUM[i+1]}<small>فريق ${i%2?'ب':'أ'}</small></span><span class="occ ${u?'':'empty'}">${esc(who)}</span>${!u&&NET.canWrite!==false?`<button class="bid pass" type="button" data-seat="${i}">اجلس هنا</button>`
+      :u&&u!==NET.uid&&host?(ui.kickArm===u?`<button class="bid kick" type="button" data-kick="${esc(u)}">متأكد؟ اطرد</button>`:`<button class="bid pass" type="button" data-kickarm="${esc(u)}">اطرد</button>`):''}</div>`;
   }).join('');
   return `<div class="modal"><div class="sheet"><h2>طاولة ${esc(NET.code)} · ${NET.n===6?'٦':'٤'} لاعبين</h2>
     <p>أرسل الكود أو الرابط لربعك. ${NET.n===6?'الكراسي ١ و٣ و٥ فريق، و٢ و٤ و٦ فريق.':'الكرسي ١ و٣ فريق، و٢ و٤ فريق.'}</p>
@@ -1095,6 +1130,8 @@ function lobbyHTML(){
 function renderModal(){
   const m=document.getElementById('modal');
   document.getElementById('btnExit').hidden=!(G||NET.on);
+  document.getElementById('btnPlayers').hidden=!(isHost()&&G);
+  if(ui.showPlayers&&isHost()&&G){m.innerHTML=playersHTML();return}
   if(showTables){const cur=document.documentElement.dataset.table;
     m.innerHTML=`<div class="modal" data-close="tables"><div class="sheet"><h2>اختر الطاولة</h2>
     <div class="tables">${TABLES.map(t=>`<button type="button" class="tpick ${t.id===cur?'on':''}" data-table-pick="${t.id}" aria-pressed="${t.id===cur}"><i style="background:radial-gradient(110% 85% at 50% 45%,${t.c[0]},${t.c[1]});border:5px solid ${t.c[2]}"></i>${t.ar}</button>`).join('')}</div>
@@ -1108,7 +1145,7 @@ function renderModal(){
     <h3>الحساب</h3><ul><li>إذا جاب المشتري وربيعه عدد الأكلات اللي طلبوه أو أكثر، يتسجل لهم الرقم اللي طلبوه.</li><li>إذا ما جابوه، يتسجل ضعف الرقم للفريق الثاني.</li><li>الجولة تنتهي على طول أول ما يجيب المشتري طلبه، أو أول ما ياخذ الفريق الثاني أكلات تكفي عشان المشتري ما يقدر يجيبه.</li></ul>
     <h3>الباوند</h3><ul><li>إذا باقي للمشتري أكلة وحدة عشان يجيب طلبه والخصم ما أخذ ولا أكلة، ينسأل المشتري إذا يبغى يشتري باوند. والباوند اختياري.</li><li>الباوند يعني لازم ياخذ هو وربيعه كل الأكلات التسع.</li><li>إذا جابه يتسجل له ${BOUND}، وإذا أخذ الخصم ولا أكلة تنتهي الجولة ويتسجل ${BOUND} للخصم.</li></ul>
     <h3>الكشف</h3><ul><li>تقدر تلعب أي ورقة، حتى لو كانت غلط حسب القوانين.</li><li>كل فريق يقدر يطلب كشف مرة وحدة في الجولة، من زر "كشف"، ويحدد اللاعب اللي يظن إنه لعب غلط.</li><li>إذا طلعت ورقة غلط من نفس اللاعب في هالجولة، تنتهي الجولة ويتسجل لهم ضعف الطلب (أو ${BOUND} إذا كان باوند).</li><li>إذا ما طلع عند هذاك اللاعب شي، حتى لو غلط لاعب ثاني، تنتهي الجولة وتنحسب عليهم: يتسجل نفس الرقم للفريق الثاني.</li><li>الكمبيوتر ما يلعب غلط، ويطلب كشف لما يشوف دليل واضح، مثل لاعب قال ما عنده لون وبعدين لعب منه.</li></ul>
-    <h3>اللعب مع الربع</h3><ul><li>زر "عبارات" يطلّع لك كلام جاهز تقوله، ويطلع فوق اسمك عند كل اللاعبين.</li><li>في موقع اللعبة على GitHub فيه زر "صوت": اضغطه واسمح للمتصفح يستخدم المايك، وتسمعون بعض. وتقدر تسكّر المايك متى ما تبغى. علامة المايك جنب الاسم تبيّن مين معكم بالصوت.</li><li>من زر "القائمة" سوّ طاولة، وأرسل الكود أو الرابط لربعك. كل واحد يختار كرسي، والكراسي الفاضية يلعبها الكمبيوتر.</li><li>صفحة صاحب الطاولة هي اللي تشغّل الكمبيوتر، فخلها مفتوحة لين تخلصون. إذا طلع، يقدر أي لاعب يكمّل اللعب من عنده، والكمبيوتر ياخذ كرسيه.</li><li>إذا لاعب ما رد دقيقة تقريباً، يقدر صاحب الطاولة يخلي الكمبيوتر يلعب بداله.</li></ul>
+    <h3>اللعب مع الربع</h3><ul><li>اللي يسوي الطاولة هو المضيف، وهو المدير: يقدر يطرد أي لاعب قبل اللعب أو في نصه من زر "اللاعبين". الكمبيوتر ياخذ كرسي المطرود، والمطرود ما يقدر يرجع لنفس الطاولة.</li><li>زر "عبارات" يطلّع لك كلام جاهز تقوله، ويطلع فوق اسمك عند كل اللاعبين.</li><li>في موقع اللعبة على GitHub فيه زر "صوت": اضغطه واسمح للمتصفح يستخدم المايك، وتسمعون بعض. وتقدر تسكّر المايك متى ما تبغى. علامة المايك جنب الاسم تبيّن مين معكم بالصوت.</li><li>من زر "القائمة" سوّ طاولة، وأرسل الكود أو الرابط لربعك. كل واحد يختار كرسي، والكراسي الفاضية يلعبها الكمبيوتر.</li><li>صفحة صاحب الطاولة هي اللي تشغّل الكمبيوتر، فخلها مفتوحة لين تخلصون. إذا طلع، يقدر أي لاعب يكمّل اللعب من عنده، والكمبيوتر ياخذ كرسيه.</li><li>إذا لاعب ما رد دقيقة تقريباً، يقدر صاحب الطاولة يخلي الكمبيوتر يلعب بداله.</li></ul>
     <p></p><button class="primary" type="button" data-close="rules">تمام</button></div></div>`;return}
   if(showLast&&G&&G.lastTrick){m.innerHTML=`<div class="modal" data-close="last"><div class="sheet"><h2>آخر أكلة</h2><p>أكلها ${esc(nameOf(G.lastTrick.winner))}</p>
     <div class="lastTrick">${G.lastTrick.cards.map(e=>cardHTML(e.c,e.p===G.lastTrick.winner?'win':'')).join('')}</div>
@@ -1179,6 +1216,8 @@ document.getElementById('modal').addEventListener('click',e=>{
   if(act==='leave')return leaveTable();
   if(act==='exitYes')return exitGame();
   if(act==='exitNo'){ui.exitAsk=false;return renderModal()}
+  const ka=e.target.closest('[data-kickarm]');if(ka){ui.kickArm=ka.dataset.kickarm;return renderModal()}
+  const kk=e.target.closest('[data-kick]');if(kk)return kickPlayer(kk.dataset.kick);
   if(act==='start')return startOnline();
   if(act==='copy'){
     const link=shareURL();
@@ -1189,7 +1228,7 @@ document.getElementById('modal').addEventListener('click',e=>{
   const seat=e.target.closest('[data-seat]');if(seat)return claimSeat(+seat.dataset.seat);
   const tp=e.target.closest('[data-table-pick]');if(tp){applyTable(tp.dataset.tablePick);return renderModal()}
   const c=e.target.closest('[data-close]');
-  if(c&&(e.target===c||e.target.tagName==='BUTTON')){showRules=false;showLast=false;showTables=false;ui.exitAsk=false;renderModal()}
+  if(c&&(e.target===c||e.target.tagName==='BUTTON')){showRules=false;showLast=false;showTables=false;ui.exitAsk=false;ui.showPlayers=false;ui.kickArm=null;renderModal()}
 });
 document.getElementById('modal').addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='joinCode')joinTable(e.target.value)});
 function selectLink(){const el=document.getElementById('tableLink');if(!el)return;const r=document.createRange();r.selectNodeContents(el);const s=getSelection();s.removeAllRanges();s.addRange(r)}
@@ -1198,6 +1237,7 @@ document.getElementById('btnTable').addEventListener('click',()=>{showTables=tru
 document.getElementById('btnLast').addEventListener('click',()=>{if(G&&G.lastTrick){showLast=true;renderModal()}});
 document.getElementById('btnHome').addEventListener('click',()=>{ui.screen='home';ui.joinErr='';renderModal()});
 document.getElementById('btnExit').addEventListener('click',()=>{ui.exitAsk=true;renderModal()});
+document.getElementById('btnPlayers').addEventListener('click',()=>{ui.showPlayers=true;ui.kickArm=null;renderModal()});
 
 /* ---------- boot ---------- */
 function boot(data){
