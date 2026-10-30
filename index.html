@@ -54,6 +54,9 @@ button:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
 .tools{display:flex;gap:6px}
 .ghost{background:transparent;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:6px 12px;font-size:13px;cursor:pointer}
 .ghost:hover{color:var(--ink);border-color:var(--muted)}
+.ghost.exit{color:var(--them);border-color:rgba(208,87,79,.45)}
+.ghost.exit:hover{color:var(--them);border-color:var(--them)}
+.pair .primary.danger{background:var(--them);color:#1b1206}
 .info{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:center;font-size:12.5px;padding-block:4px 8px}
 .chip{border:1px solid var(--line);border-radius:999px;padding:3px 10px;background:var(--panel);color:var(--ink)}
 .chip.mode{color:var(--gold);font-weight:700;border-color:rgba(227,173,75,.45)}
@@ -288,6 +291,7 @@ table.res tr.total td{color:var(--gold);font-weight:700;border-bottom:none}
       <div class="team them"><span class="tn">لهم<small id="nThem">الخصم</small></span><b id="scThem">0</b><span class="meter"><i id="mThem"></i></span></div>
     </div>
     <div class="tools">
+      <button class="ghost exit" id="btnExit" type="button" hidden>خروج</button>
       <button class="ghost" id="btnHome" type="button">القائمة</button>
       <button class="ghost" id="btnLast" type="button">آخر أكلة</button>
       <button class="ghost" id="btnTable" type="button">الطاولة</button>
@@ -317,7 +321,7 @@ const shareURL=()=>(NET.mode==='fb'?location.origin+location.pathname:ARTIFACT_U
 const CODE_CHARS='ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 
 let G=null, timer=null, justPlayed=null, showLast=false, showRules=false, showTables=false, localMsg='';
-let ui={screen:'home',joinErr:'',busy:false,copied:'',kashfArm:false};
+let ui={screen:'home',joinErr:'',busy:false,copied:'',kashfArm:false,exitAsk:false};
 // shared-table state: the table document holds the whole game; the host's page runs computer seats and timings
 let NET={mode:null,fbErr:'',ready:false,db:null,user:null,uid:null,canWrite:null,on:false,code:null,ref:null,unsubT:null,unsubS:null,
   host:null,phase:null,rev:0,lastJson:'',updatedAt:0,n:4,seatDocs:[null,null,null,null,null,null],chain:Promise.resolve(),err:''};
@@ -882,6 +886,19 @@ async function claimSeat(i){
     return true;
   }catch(e){netError(e);return false}
 }
+// leaving mid-game hands your chair to the computer; if you were running the table, another player takes that over
+async function exitGame(){
+  ui.exitAsk=false;
+  if(!NET.on){clearTimeout(timer);G=null;ui.screen='home';return render()}
+  const m=me();
+  if(G&&m>=0&&G.phase!=='over'){
+    const others=G.seats.filter((u,i)=>u&&i!==m);
+    if(NET.host===NET.uid&&others.length){try{await NET.ref.update({host:others[0]});NET.host=others[0]}catch(e){}}
+    clearTimeout(timer);G.seats[m]=null;commit();
+    try{await NET.chain}catch(e){}
+  }
+  leaveTable();
+}
 async function leaveTable(){
   const mine=NET.seatDocs.indexOf(NET.uid);
   if(NET.phase==='lobby'&&mine>=0){try{await NET.db.doc(`tables/${NET.code}/seats/s${mine}`).set({uid:null})}catch(e){}}
@@ -1077,6 +1094,7 @@ function lobbyHTML(){
 }
 function renderModal(){
   const m=document.getElementById('modal');
+  document.getElementById('btnExit').hidden=!(G||NET.on);
   if(showTables){const cur=document.documentElement.dataset.table;
     m.innerHTML=`<div class="modal" data-close="tables"><div class="sheet"><h2>اختر الطاولة</h2>
     <div class="tables">${TABLES.map(t=>`<button type="button" class="tpick ${t.id===cur?'on':''}" data-table-pick="${t.id}" aria-pressed="${t.id===cur}"><i style="background:radial-gradient(110% 85% at 50% 45%,${t.c[0]},${t.c[1]});border:5px solid ${t.c[2]}"></i>${t.ar}</button>`).join('')}</div>
@@ -1095,6 +1113,12 @@ function renderModal(){
   if(showLast&&G&&G.lastTrick){m.innerHTML=`<div class="modal" data-close="last"><div class="sheet"><h2>آخر أكلة</h2><p>أكلها ${esc(nameOf(G.lastTrick.winner))}</p>
     <div class="lastTrick">${G.lastTrick.cards.map(e=>cardHTML(e.c,e.p===G.lastTrick.winner?'win':'')).join('')}</div>
     <button class="primary" type="button" data-close="last">رجوع</button></div></div>`;return}
+  if(ui.exitAsk){
+    const online=NET.on&&G&&me()>=0&&G.phase!=='over';
+    m.innerHTML=`<div class="modal" data-close="exit"><div class="sheet"><h2>تطلع من اللعبة؟</h2>
+      <p>${online?'الكمبيوتر بيلعب مكانك لين تخلص اللعبة، وربعك يكمّلون عادي.':NET.on?'بتطلع من الطاولة.':'اللعبة الحالية بتنتهي، وترجع للقائمة.'}</p>
+      <div class="pair"><button class="primary danger" type="button" data-act="exitYes">إيه، اطلع</button><button class="primary alt" type="button" data-act="exitNo">لا، كمّل</button></div></div></div>`;
+    return}
   if(ui.screen==='home'){m.innerHTML=homeHTML();return}
   if(NET.on&&NET.phase==='lobby'&&!G){m.innerHTML=lobbyHTML();return}
   if(G&&(G.phase==='roundEnd'||G.phase==='over')&&G.summary){
@@ -1153,6 +1177,8 @@ document.getElementById('modal').addEventListener('click',e=>{
   if(act==='join'){if(needName())return;return joinTable(document.getElementById('joinCode')?.value)}
   if(act==='rejoin'){if(needName())return;return joinTable(store.get('tableCode'))}
   if(act==='leave')return leaveTable();
+  if(act==='exitYes')return exitGame();
+  if(act==='exitNo'){ui.exitAsk=false;return renderModal()}
   if(act==='start')return startOnline();
   if(act==='copy'){
     const link=shareURL();
@@ -1163,7 +1189,7 @@ document.getElementById('modal').addEventListener('click',e=>{
   const seat=e.target.closest('[data-seat]');if(seat)return claimSeat(+seat.dataset.seat);
   const tp=e.target.closest('[data-table-pick]');if(tp){applyTable(tp.dataset.tablePick);return renderModal()}
   const c=e.target.closest('[data-close]');
-  if(c&&(e.target===c||e.target.tagName==='BUTTON')){showRules=false;showLast=false;showTables=false;renderModal()}
+  if(c&&(e.target===c||e.target.tagName==='BUTTON')){showRules=false;showLast=false;showTables=false;ui.exitAsk=false;renderModal()}
 });
 document.getElementById('modal').addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='joinCode')joinTable(e.target.value)});
 function selectLink(){const el=document.getElementById('tableLink');if(!el)return;const r=document.createRange();r.selectNodeContents(el);const s=getSelection();s.removeAllRanges();s.addRange(r)}
@@ -1171,6 +1197,7 @@ document.getElementById('btnRules').addEventListener('click',()=>{showRules=true
 document.getElementById('btnTable').addEventListener('click',()=>{showTables=true;renderModal()});
 document.getElementById('btnLast').addEventListener('click',()=>{if(G&&G.lastTrick){showLast=true;renderModal()}});
 document.getElementById('btnHome').addEventListener('click',()=>{ui.screen='home';ui.joinErr='';renderModal()});
+document.getElementById('btnExit').addEventListener('click',()=>{ui.exitAsk=true;renderModal()});
 
 /* ---------- boot ---------- */
 function boot(data){
