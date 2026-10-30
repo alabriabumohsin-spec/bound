@@ -207,6 +207,11 @@ table.res tr.total td{color:var(--gold);font-weight:700;border-bottom:none}
 .kashf.used{border-style:dashed;opacity:.6;cursor:default;font-weight:500;font-size:12px;padding:6px 10px}
 .phbtn{border:1px solid var(--line);color:var(--ink);background:var(--panel);border-radius:10px;padding:8px 12px;font-size:14px;cursor:pointer;font-family:inherit}
 .phbtn.on{border-color:var(--gold);color:var(--gold)}
+.phbtn.voice{display:inline-flex;align-items:center;gap:5px}
+.mic{width:15px;height:15px;fill:currentColor;flex:none}
+.who .mic{width:13px;height:13px;color:var(--gold)}
+.who .mic.off{color:var(--muted);opacity:.7}
+.who .mic.wait{opacity:.35}
 .phrlist{flex-basis:100%;display:flex;flex-wrap:wrap;gap:6px;justify-content:center;padding-top:4px}
 .phrlist button{border:1px solid rgba(227,173,75,.45);background:rgba(0,0,0,.25);color:var(--ink);border-radius:999px;padding:6px 12px;font-size:13px;cursor:pointer;font-family:inherit}
 .phrlist button:hover{background:rgba(227,173,75,.18)}
@@ -406,7 +411,7 @@ function drive(){
   if(ph==='bid'&&isAI(G.bidTurn))schedule(()=>aiBid(G.bidTurn),800);
   else if(ph==='trump'&&isAI(G.bid.p))schedule(()=>setTrump(bestSuit(G.hands[G.bid.p]).s),900);
   else if(ph==='boundAsk'&&isAI(G.buyer))schedule(()=>decideBound(G.buyer,aiBound(G.buyer)),900);
-  else if(ph==='play'&&aiKashfTeam()>=0)schedule(()=>callKashf(aiKashfTeam(),-1),700);
+  else if(ph==='play'&&aiKashfTeam()>=0)schedule(()=>{const t=aiKashfTeam();callKashf(t,-1,aiKashfTarget(t))},700);
   else if(ph==='play'){
     if(G.trick.length===N())schedule(G.sweepTo<0?sweepTrick:resolveTrick,G.sweepTo<0?1100:380);
     else if(isAI(G.turn))schedule(()=>playCard(G.turn,aiPlay(G.turn)),650);
@@ -592,19 +597,113 @@ function aiKashfTeam(){
   }
   return -1;
 }
-function callKashf(t,by){
-  if((G.phase!=='play'&&G.phase!=='boundAsk')||G.kashfUsed[t])return;
+const aiKashfTarget=t=>G.fouls.find(f=>team(f.p)!==t&&provable(f)).p;
+// the caller names the player they accuse; only that player's wrong cards count
+function callKashf(t,by,accused){
+  if((G.phase!=='play'&&G.phase!=='boundAsk')||G.kashfUsed[t]||!(accused>=0)||team(accused)===t)return;
   G.kashfUsed[t]=true;
   const caller=by>=0?by:seatsOf().find(q=>team(q)===t&&isAI(q));
   // a right call scores for the callers; a wrong call scores the same for the other team
-  const f=G.fouls.find(x=>team(x.p)!==t)||null;
+  const f=G.fouls.find(x=>x.p===accused)||null;
   const res=[0,0],pts=G.bound?BOUND:G.bid.n*2;res[f?t:1-t]=pts;
   G.scores[0]+=res[0];G.scores[1]+=res[1];
   G.trick=[];G.sweepTo=-1;
-  G.summary={res,kashf:{t,caller,foul:f,pts},n:G.bid.n,bound:G.bound};
+  G.summary={res,kashf:{t,caller,accused,foul:f,pts},n:G.bid.n,bound:G.bound};
   G.phase=(G.scores[0]>=TARGET||G.scores[1]>=TARGET)&&G.scores[0]!==G.scores[1]?'over':'roundEnd';
   advance();
 }
+/* ---------- voice (our own site only): players' browsers talk directly over WebRTC; Firestore passes the offers and answers ---------- */
+const ICE=[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302']}];
+const MIC_SVG='<svg class="mic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>';
+const VOICE={on:false,muted:false,stream:null,sid:'',peers:{},present:{},unsubV:null,err:''};
+const voiceOK=()=>NET.mode==='fb'&&NET.on&&!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia)&&typeof RTCPeerConnection!=='undefined';
+const pairId=(a,b)=>a<b?a+'__'+b:b+'__'+a;
+async function voiceJoin(){
+  if(VOICE.on||!voiceOK())return;
+  try{VOICE.stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}})}
+  catch(e){VOICE.err='ما قدرنا نشغّل المايك. اسمح للمتصفح يستخدم المايك وجرّب مرة ثانية.';return render()}
+  Object.assign(VOICE,{on:true,muted:false,err:'',sid:Math.random().toString(36).slice(2,10)});
+  try{await NET.db.doc(`tables/${NET.code}/voice/${NET.uid}`).set({uid:NET.uid,sid:VOICE.sid,muted:false,at:Date.now()})}
+  catch(e){voiceLeave();VOICE.err='ما قدرنا ندخلك الصوت. جرّب مرة ثانية.';return render()}
+  VOICE.unsubV=NET.db.collection(`tables/${NET.code}/voice`).onSnapshot(qs=>{
+    const now={};for(const d of qs.docs){const v=d.data()||{};if(v.uid&&v.sid&&v.uid!==NET.uid)now[v.uid]=v}
+    VOICE.present=now;syncPeers();render();
+  },()=>{});
+  render();
+}
+// one connection per other player in the voice room; a player who rejoins gets a fresh one
+function syncPeers(){
+  for(const u of Object.keys(VOICE.peers))if(!VOICE.present[u]||VOICE.present[u].sid!==VOICE.peers[u].sid)dropPeer(u);
+  for(const [u,v] of Object.entries(VOICE.present))if(!VOICE.peers[u])addPeer(u,v.sid);
+}
+// the player with the smaller id sends the offer; full candidate lists ride inside the offer and answer
+function addPeer(u,sid){
+  const pc=new RTCPeerConnection({iceServers:ICE}),peer={pc,sid,audio:null,answered:false,unsub:null};
+  VOICE.peers[u]=peer;
+  VOICE.stream.getTracks().forEach(t=>pc.addTrack(t,VOICE.stream));
+  pc.ontrack=e=>{
+    if(!peer.audio){peer.audio=document.createElement('audio');peer.audio.autoplay=true;peer.audio.setAttribute('playsinline','');document.body.appendChild(peer.audio)}
+    peer.audio.srcObject=e.streams[0]||new MediaStream([e.track]);peer.audio.play().catch(()=>{});
+  };
+  pc.onconnectionstatechange=()=>render();
+  const ref=NET.db.doc(`tables/${NET.code}/rtc/${pairId(NET.uid,u)}`),caller=NET.uid<u;
+  if(caller)(async()=>{
+    await pc.setLocalDescription(await pc.createOffer());await iceDone(pc);
+    await ref.set({offer:pc.localDescription.sdp,offerSid:VOICE.sid,targetSid:sid,answer:null,answerSid:null});
+  })().catch(()=>{});
+  peer.unsub=ref.onSnapshot(s=>{
+    const d=s.exists&&s.data();if(!d)return;
+    if(caller){
+      if(d.answer&&d.offerSid===VOICE.sid&&d.answerSid===sid&&pc.signalingState==='have-local-offer')pc.setRemoteDescription({type:'answer',sdp:d.answer}).catch(()=>{});
+    }else if(d.offer&&!peer.answered&&d.targetSid===VOICE.sid&&d.offerSid===sid){
+      peer.answered=true;
+      (async()=>{
+        await pc.setRemoteDescription({type:'offer',sdp:d.offer});
+        await pc.setLocalDescription(await pc.createAnswer());await iceDone(pc);
+        await ref.update({answer:pc.localDescription.sdp,answerSid:VOICE.sid});
+      })().catch(()=>{});
+    }
+  },()=>{});
+}
+function iceDone(pc){
+  return new Promise(ok=>{
+    if(pc.iceGatheringState==='complete')return ok();
+    const t=setTimeout(ok,2500);
+    pc.addEventListener('icegatheringstatechange',()=>{if(pc.iceGatheringState==='complete'){clearTimeout(t);ok()}});
+  });
+}
+function dropPeer(u){
+  const p=VOICE.peers[u];if(!p)return;
+  try{if(p.unsub)p.unsub();p.pc.close()}catch(e){}
+  if(p.audio){p.audio.srcObject=null;p.audio.remove()}
+  delete VOICE.peers[u];
+}
+function voiceMute(){
+  if(!VOICE.on)return;
+  VOICE.muted=!VOICE.muted;VOICE.stream.getAudioTracks().forEach(t=>{t.enabled=!VOICE.muted});
+  NET.db.doc(`tables/${NET.code}/voice/${NET.uid}`).update({muted:VOICE.muted}).catch(()=>{});
+  render();
+}
+function voiceLeave(){
+  if(!VOICE.on)return;
+  VOICE.on=false;
+  if(VOICE.unsubV){VOICE.unsubV();VOICE.unsubV=null}
+  Object.keys(VOICE.peers).forEach(dropPeer);VOICE.present={};
+  if(VOICE.stream){VOICE.stream.getTracks().forEach(t=>t.stop());VOICE.stream=null}
+  if(NET.db&&NET.code)NET.db.doc(`tables/${NET.code}/voice/${NET.uid}`).delete().catch(()=>{});
+  render();
+}
+addEventListener('pagehide',()=>voiceLeave());
+// a small mic beside each name: gold when talking is open, grey when muted, faint while still connecting
+function micHTML(p){
+  if(!VOICE.on||!G||!G.seats)return '';
+  const u=G.seats[p];if(!u)return '';
+  if(u===NET.uid)return MIC_SVG.replace('class="mic"',`class="mic ${VOICE.muted?'off':''}"`);
+  const v=VOICE.present[u];if(!v)return '';
+  const st=VOICE.peers[u]&&VOICE.peers[u].pc.connectionState;
+  return MIC_SVG.replace('class="mic"',`class="mic ${v.muted?'off':st==='connected'?'':'wait'}"`);
+}
+
 function cardName(c){return isJoker(c)?(c.r==='BJ'?'الجوكر الكبير':'الجوكر الصغير'):c.r+' '+SUIT_AR[c.s]}
 
 function endRound(){
@@ -622,8 +721,8 @@ function nextRound(){G.dealer=next(G.dealer);startRound()}
 function verdictText(){
   const s=G.summary;
   if(s.kashf){const k=s.kashf,ours=k.t===team(viewSeat());
-    if(!k.foul)return `${esc(nameOf(k.caller))} طلب كشف وما طلعت أي ورقة غلط. يتسجل ${k.pts} ${ours?'لهم':'لكم'}.`;
-    return `${esc(nameOf(k.caller))} طلب كشف، وطلعت ورقة غلط من ${esc(nameOf(k.foul.p))}: ${cardName(k.foul.c)} في الأكلة ${AR_NUM[k.foul.trick]||k.foul.trick}. يتسجل ${k.pts} ${ours?'لكم':'لهم'}.`}
+    if(!k.foul)return `${esc(nameOf(k.caller))} طلب كشف على ${esc(nameOf(k.accused))}، وما طلعت عنده أي ورقة غلط. يتسجل ${k.pts} ${ours?'لهم':'لكم'}.`;
+    return `${esc(nameOf(k.caller))} طلب كشف على ${esc(nameOf(k.accused))}، وطلعت عنده ورقة غلط: ${cardName(k.foul.c)} في الأكلة ${AR_NUM[k.foul.trick]||k.foul.trick}. يتسجل ${k.pts} ${ours?'لكم':'لهم'}.`}
   const mine=team(G.buyer)===team(viewSeat());
   const who=mine?'فريقك':'الخصم',to=mine?'لهم':'لكم';
   if(s.bound)return s.made?`${who} جاب الباوند — كل الأكلات! تتسجل ${BOUND}`:`${who} ما جاب الباوند — تتسجل ${BOUND} ${to}`;
@@ -685,6 +784,7 @@ function firebaseDB(fs){
     get:()=>r.get().then(wrap,e=>{throw err(e)}),
     set:d=>r.set(d).catch(e=>{throw err(e)}),
     update:d=>r.update(d).catch(e=>{throw err(e)}),
+    delete:()=>r.delete().catch(e=>{throw err(e)}),
     onSnapshot:(next,fail)=>r.onSnapshot(s=>next(wrap(s)),e=>fail&&fail(err(e))),
     // a short lease kept in the document itself, taken inside a transaction
     acquire:({holder,ttlMs})=>fs.runTransaction(async tx=>{
@@ -752,6 +852,7 @@ function attach(code){
   },()=>{});
 }
 function detach(){
+  voiceLeave();
   if(NET.unsubT)NET.unsubT();if(NET.unsubS)NET.unsubS();if(unsubP){unsubP();unsubP=null}phr=[null,null,null,null,null,null];
   Object.assign(NET,{on:false,code:null,ref:null,unsubT:null,unsubS:null,host:null,phase:null});
 }
@@ -896,7 +997,7 @@ function render(){
     const backs=v===0&&m>=0?'':`<div class="backs">${G.hands[p].map(()=>'<div class="back"></div>').join('')}</div>`;
     const ph=phr[p]&&phr[p].until>Date.now()?PHRASES[phr[p].i]:'';
     const bub=ph?`<div class="bubble say">${esc(ph)}</div>`:G.say[p]?`<div class="bubble">${esc(G.say[p])}</div>`:'';
-    const who=`<div class="who"><span class="avatar">${esc(base[0])}</span><span>${esc(label)}</span>${tags}${v===0&&m>=0?'':`<span class="cnt">${G.hands[p].length}</span>`}</div>`;
+    const who=`<div class="who"><span class="avatar">${esc(base[0])}</span><span>${esc(label)}</span>${tags}${micHTML(p)}${v===0&&m>=0?'':`<span class="cnt">${G.hands[p].length}</span>`}</div>`;
     const pile=n===6&&hasPile(p)?pileHTML(team(p)):'';
     t+=`<div class="seat s${v} ${team(p)===U?'us':'them'} ${active===p?'turn':''}">${v===0?pile+bub+who+(m<0?backs:''):who+backs+bub+pile}</div>`;
   }
@@ -920,8 +1021,13 @@ function render(){
   }else bar.innerHTML=`<div class="status">${esc(statusText())||(m<0?'أنت تتفرّج على الطاولة':'&nbsp;')}</div>`;
   if(m>=0&&(G.phase==='play'||G.phase==='boundAsk')&&!NET.err&&!hostStalled()){
     bar.insertAdjacentHTML('beforeend',G.kashfUsed[team(m)]?'<span class="kashf used">استخدمتوا الكشف</span>'
-      :ui.kashfArm?'<button class="kashf arm" type="button" data-act="kashf">متأكد؟ اكشف</button><button class="kashf" type="button" data-act="kashfNo">لا</button>'
+      :ui.kashfArm?'<span class="status">كشف على مين؟</span>'+seatsOf().filter(q=>team(q)!==team(m)).map(q=>`<button class="kashf arm" type="button" data-act="kashf" data-p="${q}">${esc(nameOf(q))}</button>`).join('')+'<button class="kashf" type="button" data-act="kashfNo">لا</button>'
       :'<button class="kashf" type="button" data-act="kashfArm">كشف</button>');
+  }
+  if(m>=0&&voiceOK()){
+    bar.insertAdjacentHTML('beforeend',!VOICE.on?`<button class="phbtn voice" type="button" data-act="voiceOn">${MIC_SVG}صوت</button>`
+      :`<button class="phbtn voice ${VOICE.muted?'':'on'}" type="button" data-act="voiceMute" aria-pressed="${VOICE.muted}">${MIC_SVG}${VOICE.muted?'المايك مسكّر':'المايك مفتوح'}</button><button class="phbtn" type="button" data-act="voiceOff">اطلع من الصوت</button>`);
+    if(VOICE.err)bar.insertAdjacentHTML('beforeend',`<div class="status err" style="flex-basis:100%">${esc(VOICE.err)}</div>`);
   }
   if(m>=0){
     bar.insertAdjacentHTML('beforeend',`<button class="phbtn ${ui.phrOpen?'on':''}" type="button" data-act="phr" aria-expanded="${!!ui.phrOpen}">عبارات</button>`
@@ -983,8 +1089,8 @@ function renderModal(){
     <h3>الجوكر</h3><ul><li>فيه جوكر كبير وجوكر صغير.</li><li>الكبير ياكل أي ورقة، والصغير ياكل كل شي إلا الكبير.</li><li>الجوكر الصغير ينلعب في أول ثلاث أكلات، حتى لو عندك اللون. وإذا ما لعبته، لازم تلعبه في الأكلة الثالثة.</li><li>انتبه لا تتورط وتبدأ الأكلة الثالثة والجوكر الصغير معك: إذا صار كذا، يصير الجوكر الصغير ورقة بيضة ما تاكل شي، وترميه متى ما تبغى.</li><li>الجوكر الكبير ما ينلعب إلا بعد ما ينزل الصغير أو يصير بيضة، وبعدها تقدر تلعبه في أي وقت.</li><li>الجوكر ما ينزل أول ورقة في الأكلة.</li><li>الجوكر يُحسب حكم.</li></ul>
     <h3>الحساب</h3><ul><li>إذا جاب المشتري وربيعه عدد الأكلات اللي طلبوه أو أكثر، يتسجل لهم الرقم اللي طلبوه.</li><li>إذا ما جابوه، يتسجل ضعف الرقم للفريق الثاني.</li><li>الجولة تنتهي على طول أول ما يجيب المشتري طلبه، أو أول ما ياخذ الفريق الثاني أكلات تكفي عشان المشتري ما يقدر يجيبه.</li></ul>
     <h3>الباوند</h3><ul><li>إذا باقي للمشتري أكلة وحدة عشان يجيب طلبه والخصم ما أخذ ولا أكلة، ينسأل المشتري إذا يبغى يشتري باوند. والباوند اختياري.</li><li>الباوند يعني لازم ياخذ هو وربيعه كل الأكلات التسع.</li><li>إذا جابه يتسجل له ${BOUND}، وإذا أخذ الخصم ولا أكلة تنتهي الجولة ويتسجل ${BOUND} للخصم.</li></ul>
-    <h3>الكشف</h3><ul><li>تقدر تلعب أي ورقة، حتى لو كانت غلط حسب القوانين.</li><li>كل فريق يقدر يطلب كشف مرة وحدة في الجولة، من زر "كشف".</li><li>إذا لقوا ورقة غلط من الفريق الثاني في هالجولة، تنتهي الجولة ويتسجل لهم ضعف الطلب (أو ${BOUND} إذا كان باوند).</li><li>إذا ما لقوا شي، تنتهي الجولة وتنحسب عليهم: يتسجل نفس الرقم للفريق الثاني.</li><li>الكمبيوتر ما يلعب غلط، ويطلب كشف لما يشوف دليل واضح، مثل لاعب قال ما عنده لون وبعدين لعب منه.</li></ul>
-    <h3>اللعب مع الربع</h3><ul><li>زر "عبارات" يطلّع لك كلام جاهز تقوله، ويطلع فوق اسمك عند كل اللاعبين.</li><li>من زر "القائمة" سوّ طاولة، وأرسل الكود أو الرابط لربعك. كل واحد يختار كرسي، والكراسي الفاضية يلعبها الكمبيوتر.</li><li>صفحة صاحب الطاولة هي اللي تشغّل الكمبيوتر، فخلها مفتوحة لين تخلصون. إذا طلع، يقدر أي لاعب يكمّل اللعب من عنده، والكمبيوتر ياخذ كرسيه.</li><li>إذا لاعب ما رد دقيقة تقريباً، يقدر صاحب الطاولة يخلي الكمبيوتر يلعب بداله.</li></ul>
+    <h3>الكشف</h3><ul><li>تقدر تلعب أي ورقة، حتى لو كانت غلط حسب القوانين.</li><li>كل فريق يقدر يطلب كشف مرة وحدة في الجولة، من زر "كشف"، ويحدد اللاعب اللي يظن إنه لعب غلط.</li><li>إذا طلعت ورقة غلط من نفس اللاعب في هالجولة، تنتهي الجولة ويتسجل لهم ضعف الطلب (أو ${BOUND} إذا كان باوند).</li><li>إذا ما طلع عند هذاك اللاعب شي، حتى لو غلط لاعب ثاني، تنتهي الجولة وتنحسب عليهم: يتسجل نفس الرقم للفريق الثاني.</li><li>الكمبيوتر ما يلعب غلط، ويطلب كشف لما يشوف دليل واضح، مثل لاعب قال ما عنده لون وبعدين لعب منه.</li></ul>
+    <h3>اللعب مع الربع</h3><ul><li>زر "عبارات" يطلّع لك كلام جاهز تقوله، ويطلع فوق اسمك عند كل اللاعبين.</li><li>في موقع اللعبة على GitHub فيه زر "صوت": اضغطه واسمح للمتصفح يستخدم المايك، وتسمعون بعض. وتقدر تسكّر المايك متى ما تبغى. علامة المايك جنب الاسم تبيّن مين معكم بالصوت.</li><li>من زر "القائمة" سوّ طاولة، وأرسل الكود أو الرابط لربعك. كل واحد يختار كرسي، والكراسي الفاضية يلعبها الكمبيوتر.</li><li>صفحة صاحب الطاولة هي اللي تشغّل الكمبيوتر، فخلها مفتوحة لين تخلصون. إذا طلع، يقدر أي لاعب يكمّل اللعب من عنده، والكمبيوتر ياخذ كرسيه.</li><li>إذا لاعب ما رد دقيقة تقريباً، يقدر صاحب الطاولة يخلي الكمبيوتر يلعب بداله.</li></ul>
     <p></p><button class="primary" type="button" data-close="rules">تمام</button></div></div>`;return}
   if(showLast&&G&&G.lastTrick){m.innerHTML=`<div class="modal" data-close="last"><div class="sheet"><h2>آخر أكلة</h2><p>أكلها ${esc(nameOf(G.lastTrick.winner))}</p>
     <div class="lastTrick">${G.lastTrick.cards.map(e=>cardHTML(e.c,e.p===G.lastTrick.winner?'win':'')).join('')}</div>
@@ -1015,10 +1121,14 @@ document.getElementById('bar').addEventListener('click',e=>{
   const m=me();
   if(e.target.closest('[data-act="takeover"]'))return takeOver();
   if(e.target.closest('[data-act="replace"]'))return replaceSeat(humanStalled());
+  const va=e.target.closest('[data-act^="voice"]')?.dataset.act;
+  if(va==='voiceOn')return voiceJoin();
+  if(va==='voiceMute')return voiceMute();
+  if(va==='voiceOff')return voiceLeave();
   if(e.target.closest('[data-act="phr"]')){ui.phrOpen=!ui.phrOpen;return render()}
   const ph=e.target.closest('[data-phr]');if(ph)return sayPhrase(+ph.dataset.phr);
   const k=e.target.closest('[data-act^="kashf"]')?.dataset.act;
-  if(k){ui.kashfArm=k==='kashfArm';if(k==='kashf')return callKashf(team(m),m);return render()}
+  if(k){ui.kashfArm=k==='kashfArm';if(k==='kashf')return callKashf(team(m),m,+e.target.closest('[data-p]').dataset.p);return render()}
   const b=e.target.closest('[data-bid]');if(b)return doBid(m,b.dataset.bid==='pass'?'pass':+b.dataset.bid);
   const t=e.target.closest('[data-trump]');if(t&&G.bid.p===m)return setTrump(t.dataset.trump);
   const bd=e.target.closest('[data-bound]');if(bd)decideBound(m,bd.dataset.bound==='yes');
